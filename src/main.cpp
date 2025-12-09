@@ -29,13 +29,13 @@ int transitionCountThisHour = 0;
 // count of transitions that occurred within the previous hour.
 const int TRANSITION_EVENTS_MAX = 256;
 unsigned long transition_event_times[TRANSITION_EVENTS_MAX];
-int transition_event_count = 0;
+volatile int transition_event_count = 0;
 // Last parsed PID output (numeric) for display
 int lastPidOutput = 0;
 
-// Transition series buffer (24h window, 1 sample/min)
-const int TRANS_GRAPH_POINTS_MAX = 24 * 60; // samples for 24 hours at 1/min
-const unsigned long TRANS_GRAPH_INTERVAL = 60000UL; // 1 minute
+// Transition series buffer (24h window, 1 sample/30min)
+const int TRANS_GRAPH_POINTS_MAX = 24 * 2; // samples for 24 hours at 1/30min (48 samples)
+const unsigned long TRANS_GRAPH_INTERVAL = 30UL * 60000UL; // 30 minutes
 unsigned long trans_time[TRANS_GRAPH_POINTS_MAX];
 int trans_val[TRANS_GRAPH_POINTS_MAX];
 int trans_count = 0;
@@ -73,7 +73,8 @@ struct SharedData {
   char temperature[32];
   char s1_radius[32];
   char v5v[32];
-  char pid_output[32];
+  int pid_output;
+  bool lapFlag;
 } sharedData;
 
 
@@ -94,18 +95,18 @@ void receiveCallback(const uint8_t *mac, const uint8_t *data, int len) {
         return;
     }
 
-    // Parse the 11 space-separated values
+    // Parse the 11 or 12 space-separated values (lapFlag is optional)
     uint8_t vehicleID;
     char vehicleStatus[32], vBatt[32], vCharge[32], iCharge[32], charge_status[32], status_bits[32];
-    char temperature[32], s1_radius[32], v5v[32];
-    char pid_output[8]; // allow up to 4 chars + NUL, keep small local buffer
-    
-    int parsed = sscanf(buffer, "-%hhu %s %s %s %s %s %s %s %s %s %4s", 
-          &vehicleID, vehicleStatus, vBatt, vCharge, iCharge, charge_status, status_bits, temperature, s1_radius, v5v, pid_output);
+    char temperature[32], s1_radius[32], v5v[32], pid_output_str[32];
+    int lapFlagInt = 0;
 
-    // Verify we got all 11 values (vehicleID + 10 more)
-    if (parsed != 11) {
-        return;
+    int parsed = sscanf(buffer, "-%hhu %s %s %s %s %s %s %s %s %s %s %d",
+        &vehicleID, vehicleStatus, vBatt, vCharge, iCharge, charge_status, status_bits, temperature, s1_radius, v5v, pid_output_str, &lapFlagInt);
+
+    // Verify we got at least 11 values (vehicleID + 10 more). lapFlag is optional.
+    if (parsed < 11) {
+      return;
     }
 
     // If vehicleID is the one we want, copy parsed fields into sharedData and signal main loop
@@ -134,8 +135,8 @@ void receiveCallback(const uint8_t *mac, const uint8_t *data, int len) {
       sharedData.s1_radius[sizeof(sharedData.s1_radius) - 1] = '\0';
       strncpy(sharedData.v5v, v5v, sizeof(sharedData.v5v) - 1);
       sharedData.v5v[sizeof(sharedData.v5v) - 1] = '\0';
-      strncpy(sharedData.pid_output, pid_output, sizeof(sharedData.pid_output) - 1);
-      sharedData.pid_output[sizeof(sharedData.pid_output) - 1] = '\0';
+      sharedData.pid_output = (int)atof(pid_output_str);
+      sharedData.lapFlag = lapFlagInt ? true : false;
       newDataAvailable = true;
       interrupts();
     }
@@ -270,8 +271,8 @@ void drawVBattGraph() {
     for (int i = 1; i < trans_count; i++) {
       if (trans_val[i] > tMaxInt) tMaxInt = trans_val[i];
     }
-    float tMin = 12.0f;
-    float tMax = (float)tMaxInt;
+    float tMin = 5.0f; // Y axis minimum for transitions graph
+    float tMax = (float)tMaxInt; // Y axis max for transitions graph. It automatically changes to match the largest value
     if (tMax <= tMin) tMax = tMin + 1.0f;
 
     for (int i = 0; i < trans_count - 1; i++) {
@@ -317,11 +318,13 @@ void updateDisplayFromData() {
   char temperatureLoc[32];
   char s1_radiusLoc[32];
   char v5vLoc[32];
-  char pid_outputLoc[32];
+  int pid_outputLoc;
   uint8_t vehicleIDLoc = 0;
+  bool lapFlagLoc = false;
 
   noInterrupts();
   vehicleIDLoc = sharedData.vehicleID;
+  lapFlagLoc = sharedData.lapFlag;
   strncpy(vehicleStatusLoc, sharedData.vehicleStatus, sizeof(vehicleStatusLoc) - 1);
   vehicleStatusLoc[sizeof(vehicleStatusLoc) - 1] = '\0';
   strncpy(vBattLoc, sharedData.vBatt, sizeof(vBattLoc) - 1);
@@ -340,8 +343,7 @@ void updateDisplayFromData() {
   s1_radiusLoc[sizeof(s1_radiusLoc) - 1] = '\0';
   strncpy(v5vLoc, sharedData.v5v, sizeof(v5vLoc) - 1);
   v5vLoc[sizeof(v5vLoc) - 1] = '\0';
-  strncpy(pid_outputLoc, sharedData.pid_output, sizeof(pid_outputLoc) - 1);
-  pid_outputLoc[sizeof(pid_outputLoc) - 1] = '\0';
+  pid_outputLoc = sharedData.pid_output;
   // mark consumed
   newDataAvailable = false;
   interrupts();
@@ -405,7 +407,7 @@ void updateDisplayFromData() {
   // Draw pid_output as a yellow 4x4 pixel square mapped across the full width
   // pid range: 800 (left) .. 2200 (right). Place directly below second text line.
   {
-    int pid = atoi(pid_outputLoc);
+    int pid = pid_outputLoc;
     // Clamp to new range
     if (pid < 800) pid = 800;
     if (pid > 2200) pid = 2200;
@@ -468,52 +470,24 @@ void updateDisplayFromData() {
     drawVBattGraph();
   }
 
-  // Track Driving->Charging transitions by recording timestamps.
-  // We keep an event timestamp buffer and compute transitionCountThisHour
-  // as the number of events within the past hour (sliding window).
-  if (strcmp(lastVehicleStatus, vehicleStatusLoc) != 0) {
-    // Status changed
-    if (strcmp(lastVehicleStatus, "1") == 0 && strcmp(vehicleStatusLoc, "2") == 0) {
-      // Transition from Driving (1) to Charging (2) -> record event
-      if (transition_event_count >= TRANSITION_EVENTS_MAX) {
-        // buffer full: drop oldest by shifting left one
-        for (int i = 0; i < TRANSITION_EVENTS_MAX - 1; i++) {
-          transition_event_times[i] = transition_event_times[i + 1];
-        }
-        transition_event_count = TRANSITION_EVENTS_MAX - 1;
+  // Track transitions only when lapFlag is received as 1
+  if (lapFlagLoc) {
+    noInterrupts();
+    if (transition_event_count >= TRANSITION_EVENTS_MAX) {
+      // buffer full: drop oldest by shifting left one
+      for (int i = 0; i < TRANSITION_EVENTS_MAX - 1; i++) {
+        transition_event_times[i] = transition_event_times[i + 1];
       }
-      transition_event_times[transition_event_count++] = now;
+      transition_event_count = TRANSITION_EVENTS_MAX - 1;
     }
+    transition_event_times[transition_event_count++] = now;
+    interrupts();
+  }
+  
+  // Update last status for display purposes
+  if (strcmp(lastVehicleStatus, vehicleStatusLoc) != 0) {
     strncpy(lastVehicleStatus, vehicleStatusLoc, sizeof(lastVehicleStatus) - 1);
     lastVehicleStatus[sizeof(lastVehicleStatus) - 1] = '\0';
-  }
-
-  // Prune events older than 1 hour and update transitionCountThisHour
-  unsigned long cutoff = (now > 3600000UL) ? (now - 3600000UL) : 0;
-  // Remove oldest entries until all remaining are within the last hour
-  while (transition_event_count > 0 && transition_event_times[0] < cutoff) {
-    for (int i = 0; i < transition_event_count - 1; i++) {
-      transition_event_times[i] = transition_event_times[i + 1];
-    }
-    transition_event_count--;
-  }
-  transitionCountThisHour = transition_event_count;
-
-  // Periodic sample of transitionCountThisHour (once per minute)
-  if (now - lastTransSample >= TRANS_GRAPH_INTERVAL) {
-    lastTransSample = now;
-    if (trans_count >= TRANS_GRAPH_POINTS_MAX) {
-      for (int i = 0; i < TRANS_GRAPH_POINTS_MAX - 1; i++) {
-        trans_time[i] = trans_time[i + 1];
-        trans_val[i] = trans_val[i + 1];
-      }
-      trans_count--;
-    }
-    trans_time[trans_count] = now;
-    trans_val[trans_count] = transitionCountThisHour;
-    trans_count++;
-    // Redraw graph to include transitions
-    drawVBattGraph();
   }
 }
 
@@ -551,7 +525,7 @@ void updateElapsedTimeDisplay() {
     lcd.print("L ");
 
     // Display elapsed time after transitions
-    if (elapsed_s > 20) {
+    if (elapsed_s > 10) {
       lcd.setTextColor(ST77XX_RED);
     } else {
       lcd.setTextColor(ST77XX_WHITE);
@@ -559,11 +533,8 @@ void updateElapsedTimeDisplay() {
     lcd.print(timebuf);
 }
 
-
-
 void setup() {
   Serial.begin(115200);
-  Serial.println("Setup Starting");
   pinMode(LCD_BLK, OUTPUT);
   digitalWrite(LCD_BLK, HIGH); // Turn on backlight
 
@@ -574,20 +545,14 @@ void setup() {
   // Set ESP32 in STA mode for ESP-NOW
   WiFi.mode(WIFI_STA);
 
-  // Print MAC address
-  Serial.print("MAC Address: ");
-  Serial.println(WiFi.macAddress());
-
   // Disconnect from WiFi (to use ESP-NOW)
   WiFi.disconnect();
 
   // Initialize ESP-NOW
   if (esp_now_init() == ESP_OK) {
-    Serial.println("ESP-NOW Init Success");
     esp_now_register_recv_cb(receiveCallback);  // Register receive callback
     esp_now_register_send_cb(sentCallback);     // Register send callback
   } else {
-    Serial.println("ESP-NOW Init Failed");
     delay(1000);
     ESP.restart();
   }
@@ -598,12 +563,58 @@ void loop() {
   unsigned long currentMillis = millis();
 
   // Run the block every 100ms
-  if (currentMillis - previousMillis >= 100) { 
-      previousMillis = currentMillis; 
-      
+  if (currentMillis - previousMillis >= 100) {
+    previousMillis = currentMillis;
+    
+    // Prune events older than 1 hour and update transitionCountThisHour
+    unsigned long now = millis();
+    unsigned long cutoff = (now > 3600000UL) ? (now - 3600000UL) : 0;
+    // Remove oldest entries until all remaining are within the last hour
+    noInterrupts();
+    while (transition_event_count > 0 && transition_event_times[0] < cutoff) {
+      for (int i = 0; i < transition_event_count - 1; i++) {
+        transition_event_times[i] = transition_event_times[i + 1];
+      }
+      transition_event_count--;
+    }
+    transitionCountThisHour = transition_event_count;
+    interrupts();
+
+    // Periodic sample of transitionCountThisHour (once per minute)
+    if (now - lastTransSample >= TRANS_GRAPH_INTERVAL) {
+      lastTransSample = now;
+      if (trans_count >= TRANS_GRAPH_POINTS_MAX) {
+        for (int i = 0; i < TRANS_GRAPH_POINTS_MAX - 1; i++) {
+          trans_time[i] = trans_time[i + 1];
+          trans_val[i] = trans_val[i + 1];
+        }
+        trans_count--;
+      }
+      trans_time[trans_count] = now;
+      trans_val[trans_count] = transitionCountThisHour;
+      trans_count++;
+      // Redraw graph to include transitions
+      drawVBattGraph();
+    }
+
+    // Draw solid red border if elapsed_s > 20
+    unsigned long elapsed_ms = millis() - lastDesiredVehicleReceiveTime;
+    unsigned long elapsed_s = elapsed_ms / 1000;
+    int thickness = 3;
+    if (elapsed_s > 20) {
+      // Top
+      lcd.fillRect(0, 0, screenWidth, thickness, ST77XX_RED);
+      // Bottom
+      lcd.fillRect(0, screenHeight - thickness, screenWidth, thickness, ST77XX_RED);
+      // Left
+      lcd.fillRect(0, 0, thickness, screenHeight, ST77XX_RED);
+      // Right
+      lcd.fillRect(screenWidth - thickness, 0, thickness, screenHeight, ST77XX_RED);
+    }
+
     // Update elapsed time display
     updateElapsedTimeDisplay();
-      
+
     // If new data is available from ESP-NOW callback, update display
     if (newDataAvailable) {
       updateDisplayFromData();
