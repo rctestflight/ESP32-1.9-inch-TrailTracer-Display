@@ -70,6 +70,7 @@ struct SharedData {
   char iCharge[32];
   char charge_status[32];
   char status_bits[32];
+  int charge_code;
   char temperature[32];
   char s1_radius[32];
   char v5v[32];
@@ -95,22 +96,72 @@ void receiveCallback(const uint8_t *mac, const uint8_t *data, int len) {
         return;
     }
 
-    // Parse the 11 or 12 space-separated values (lapFlag is optional)
+    // Parse the space-separated values (new format includes charge_code)
     uint8_t vehicleID;
     char vehicleStatus[32], vBatt[32], vCharge[32], iCharge[32], charge_status[32], status_bits[32];
     char temperature[32], s1_radius[32], v5v[32], pid_output_str[32];
+    int charge_codeInt = 0;
     int lapFlagInt = 0;
 
-    int parsed = sscanf(buffer, "-%hhu %s %s %s %s %s %s %s %s %s %s %d",
-        &vehicleID, vehicleStatus, vBatt, vCharge, iCharge, charge_status, status_bits, temperature, s1_radius, v5v, pid_output_str, &lapFlagInt);
+    // Try parsing with new format (includes charge_code after status_bits)
+    int parsed = sscanf(buffer, "-%hhu %31s %31s %31s %31s %31s %31s %d %31s %31s %31s %31s %d",
+        &vehicleID, vehicleStatus, vBatt, vCharge, iCharge, charge_status, status_bits, &charge_codeInt,
+        temperature, s1_radius, v5v, pid_output_str, &lapFlagInt);
 
-    // Verify we got at least 11 values (vehicleID + 10 more). lapFlag is optional.
+    // Fallback to old format (without charge_code) if we didn't get at least 12 fields
+    if (parsed < 12) {
+      charge_codeInt = 0; // default when not present
+      lapFlagInt = 0;
+      parsed = sscanf(buffer, "-%hhu %31s %31s %31s %31s %31s %31s %31s %31s %31s %31s %d",
+          &vehicleID, vehicleStatus, vBatt, vCharge, iCharge, charge_status, status_bits,
+          temperature, s1_radius, v5v, pid_output_str, &lapFlagInt);
+    }
+
+    // Verify we got at least 11 values (vehicleID + 10 more). lapFlag remains optional.
     if (parsed < 11) {
       return;
     }
 
+    
     // If vehicleID is the one we want, copy parsed fields into sharedData and signal main loop
     if (vehicleID == desiredVehicleID) {
+      ///*
+      // Print all parsed data
+      //Serial.print("VehicleID: ");
+      //Serial.print(vehicleID);
+
+      Serial.print(" | Status: ");
+      if (strcmp(vehicleStatus, "0") == 0) {
+        Serial.print("stuck");
+      } else if (strcmp(vehicleStatus, "1") == 0) {
+        Serial.print("driving");
+      } else if (strcmp(vehicleStatus, "2") == 0) {
+        Serial.print("charging");}
+      
+      Serial.print(" | vBatt: ");
+      Serial.print(vBatt);
+      Serial.print(" | vCharge: ");
+      Serial.print(vCharge);
+      Serial.print(" | iCharge: ");
+      Serial.print(iCharge);
+      //Serial.print(" | ChargeStatus: ");
+      //Serial.print(charge_status);
+      Serial.print(" | StatusBits: ");
+      Serial.print(status_bits);
+      Serial.print(" | ChargeCode: ");
+      Serial.println((unsigned long)charge_codeInt);
+      //Serial.print(" | Temp: ");
+      //Serial.print(temperature);
+      //Serial.print(" | s1_radius: ");
+      //Serial.print(s1_radius);
+      //Serial.print(" | v5v: ");
+      //Serial.println(v5v);
+      //Serial.print(" | PID: ");
+      //Serial.print(pid_output_str);
+      //Serial.print(" | lapFlag: ");
+      //Serial.println(lapFlagInt);
+      //*/
+
       // Update the last receive time for this vehicle ID
       lastDesiredVehicleReceiveTime = millis();
 
@@ -129,6 +180,7 @@ void receiveCallback(const uint8_t *mac, const uint8_t *data, int len) {
       sharedData.charge_status[sizeof(sharedData.charge_status) - 1] = '\0';
       strncpy(sharedData.status_bits, status_bits, sizeof(sharedData.status_bits) - 1);
       sharedData.status_bits[sizeof(sharedData.status_bits) - 1] = '\0';
+      sharedData.charge_code = charge_codeInt;
       strncpy(sharedData.temperature, temperature, sizeof(sharedData.temperature) - 1);
       sharedData.temperature[sizeof(sharedData.temperature) - 1] = '\0';
       strncpy(sharedData.s1_radius, s1_radius, sizeof(sharedData.s1_radius) - 1);
