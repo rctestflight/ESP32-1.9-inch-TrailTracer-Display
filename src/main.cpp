@@ -12,7 +12,7 @@
 #define LCD_RST 4
 #define LCD_BLK 32
 
-int desiredVehicleID = 2; //set this to the desired vehicle ID. 1: front track. 2: west track
+int desiredVehicleID = 2; //set this to the desired vehicle ID. 1: front track. 2: west track 4: South track
 
 const int textSize = 3;
 const int screenWidth = 320;
@@ -32,6 +32,16 @@ unsigned long transition_event_times[TRANSITION_EVENTS_MAX];
 volatile int transition_event_count = 0;
 // Last parsed PID output (numeric) for display
 int lastPidOutput = 0;
+
+// Status time tracking (1 hour rolling window)
+const int STATUS_EVENTS_MAX = 256;
+struct StatusEvent {
+  unsigned long timestamp;
+  uint8_t status; // 0=stuck, 1=driving, 2=charging
+};
+StatusEvent status_events[STATUS_EVENTS_MAX];
+int status_event_count = 0;
+char lastTrackedStatus[32] = "";
 
 // Transition series buffer (24h window, 1 sample/30min)
 const int TRANS_GRAPH_POINTS_MAX = 24 * 2; // samples for 24 hours at 1/30min (48 samples)
@@ -96,29 +106,21 @@ void receiveCallback(const uint8_t *mac, const uint8_t *data, int len) {
         return;
     }
 
-    // Parse the space-separated values (new format includes charge_code)
+    // Parse the space-separated values (new format: vehicleID, vehicleStatus, millis, vbatt, vcharge, icharge, charge_status, status_bits, charge_code, temperature, s1_radius, v5v, pid_output, lapFlag)
     uint8_t vehicleID;
     char vehicleStatus[32], vBatt[32], vCharge[32], iCharge[32], charge_status[32], status_bits[32];
     char temperature[32], s1_radius[32], v5v[32], pid_output_str[32];
+    unsigned long vehicleMillis = 0;
     int charge_codeInt = 0;
     int lapFlagInt = 0;
 
-    // Try parsing with new format (includes charge_code after status_bits)
-    int parsed = sscanf(buffer, "-%hhu %31s %31s %31s %31s %31s %31s %d %31s %31s %31s %31s %d",
-        &vehicleID, vehicleStatus, vBatt, vCharge, iCharge, charge_status, status_bits, &charge_codeInt,
+    // Parse the new format with all 14 fields (including millis and lapFlag)
+    int parsed = sscanf(buffer, "-%hhu %31s %lu %31s %31s %31s %31s %31s %d %31s %31s %31s %31s %d",
+        &vehicleID, vehicleStatus, &vehicleMillis, vBatt, vCharge, iCharge, charge_status, status_bits, &charge_codeInt,
         temperature, s1_radius, v5v, pid_output_str, &lapFlagInt);
 
-    // Fallback to old format (without charge_code) if we didn't get at least 12 fields
-    if (parsed < 12) {
-      charge_codeInt = 0; // default when not present
-      lapFlagInt = 0;
-      parsed = sscanf(buffer, "-%hhu %31s %31s %31s %31s %31s %31s %31s %31s %31s %31s %d",
-          &vehicleID, vehicleStatus, vBatt, vCharge, iCharge, charge_status, status_bits,
-          temperature, s1_radius, v5v, pid_output_str, &lapFlagInt);
-    }
-
-    // Verify we got at least 11 values (vehicleID + 10 more). lapFlag remains optional.
-    if (parsed < 11) {
+    // Verify we got at least 13 values (vehicleID through pid_output). lapFlag is at position 14.
+    if (parsed < 13) {
       return;
     }
 
@@ -138,6 +140,8 @@ void receiveCallback(const uint8_t *mac, const uint8_t *data, int len) {
       } else if (strcmp(vehicleStatus, "2") == 0) {
         Serial.print("charging");}
       
+      Serial.print(" | Millis: ");
+      Serial.print(vehicleMillis);
       Serial.print(" | vBatt: ");
       Serial.print(vBatt);
       Serial.print(" | vCharge: ");
@@ -149,13 +153,13 @@ void receiveCallback(const uint8_t *mac, const uint8_t *data, int len) {
       Serial.print(" | StatusBits: ");
       Serial.print(status_bits);
       Serial.print(" | ChargeCode: ");
-      Serial.println((unsigned long)charge_codeInt);
+      Serial.print((unsigned long)charge_codeInt);
       //Serial.print(" | Temp: ");
       //Serial.print(temperature);
-      //Serial.print(" | s1_radius: ");
-      //Serial.print(s1_radius);
-      //Serial.print(" | v5v: ");
-      //Serial.println(v5v);
+      Serial.print(" | s1_radius: ");
+      Serial.print(s1_radius);
+      Serial.print(" | v5v: ");
+      Serial.println(v5v);
       //Serial.print(" | PID: ");
       //Serial.print(pid_output_str);
       //Serial.print(" | lapFlag: ");
@@ -536,6 +540,30 @@ void updateDisplayFromData() {
     interrupts();
   }
   
+  // Track status changes for rolling 1-hour window
+  if (strcmp(lastTrackedStatus, vehicleStatusLoc) != 0) {
+    // Status changed - record the event
+    unsigned long currentTime = millis();
+    uint8_t statusCode = 0;
+    if (strcmp(vehicleStatusLoc, "1") == 0) statusCode = 1; // driving
+    else if (strcmp(vehicleStatusLoc, "2") == 0) statusCode = 2; // charging
+    
+    // Add event to buffer
+    if (status_event_count >= STATUS_EVENTS_MAX) {
+      // Buffer full: shift left to drop oldest
+      for (int i = 0; i < STATUS_EVENTS_MAX - 1; i++) {
+        status_events[i] = status_events[i + 1];
+      }
+      status_event_count = STATUS_EVENTS_MAX - 1;
+    }
+    status_events[status_event_count].timestamp = currentTime;
+    status_events[status_event_count].status = statusCode;
+    status_event_count++;
+    
+    strncpy(lastTrackedStatus, vehicleStatusLoc, sizeof(lastTrackedStatus) - 1);
+    lastTrackedStatus[sizeof(lastTrackedStatus) - 1] = '\0';
+  }
+  
   // Update last status for display purposes
   if (strcmp(lastVehicleStatus, vehicleStatusLoc) != 0) {
     strncpy(lastVehicleStatus, vehicleStatusLoc, sizeof(lastVehicleStatus) - 1);
@@ -564,9 +592,9 @@ void updateElapsedTimeDisplay() {
     
     // Clear just the time area at the end of the second line and redraw
     int firstLinePx = 8 * textSize + 4;
-    int timeX = 220;  // Position for far right of screen
-    // Clear only the area covering the transition counter and elapsed time text (70 wide, 18 tall)
-    lcd.fillRect(timeX, firstLinePx, 70, 18, ST77XX_BLACK);
+    int timeX = 180;  // Position for far right of screen (moved left to make room)
+    // Clear only the area covering the transition counter, driving %, and elapsed time text (140 wide, 18 tall)
+    lcd.fillRect(timeX, firstLinePx, 140, 18, ST77XX_BLACK);
     lcd.setCursor(timeX, firstLinePx);
     lcd.setTextSize(2);
     lcd.setTextColor(ST77XX_BLUE);
@@ -576,7 +604,37 @@ void updateElapsedTimeDisplay() {
     lcd.print(transitionCountThisHour);
     lcd.print("L ");
 
-    // Display elapsed time after transitions
+    // Calculate and display driving percentage (last hour)
+    unsigned long now = millis();
+    unsigned long oneHourAgo = (now > 3600000UL) ? (now - 3600000UL) : 0;
+    unsigned long drivingTime = 0;
+    unsigned long chargingTime = 0;
+    
+    // Calculate time in each state from events within the last hour
+    for (int i = 0; i < status_event_count; i++) {
+      if (status_events[i].timestamp < oneHourAgo) continue; // Skip events older than 1 hour
+      
+      // Calculate duration of this status period
+      unsigned long periodStart = status_events[i].timestamp;
+      unsigned long periodEnd = (i < status_event_count - 1) ? status_events[i + 1].timestamp : now;
+      unsigned long duration = periodEnd - periodStart;
+      
+      if (status_events[i].status == 1) {
+        drivingTime += duration;
+      } else if (status_events[i].status == 2) {
+        chargingTime += duration;
+      }
+    }
+    
+    unsigned long totalTime = drivingTime + chargingTime;
+    if (totalTime > 0) {
+      int drivingPercent = (int)((drivingTime * 100) / totalTime);
+      lcd.setTextColor(ST77XX_YELLOW);
+      lcd.print(drivingPercent);
+      lcd.print("% ");
+    }
+
+    // Display elapsed time after percentage
     if (elapsed_s > 10) {
       lcd.setTextColor(ST77XX_RED);
     } else {
