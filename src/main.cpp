@@ -12,7 +12,7 @@
 #define LCD_RST 4
 #define LCD_BLK 32
 
-int desiredVehicleID = 2; //set this to the desired vehicle ID. 1: front track. 2: west track 4: South track
+int desiredVehicleID = 4; //set this to the desired vehicle ID. 1: front track. 2: west track 4: South track
 
 const int textSize = 3;
 const int screenWidth = 320;
@@ -21,6 +21,10 @@ const int screenHeight = 170;
 unsigned long previousMillis = 0;
 
 unsigned long lastDesiredVehicleReceiveTime = 0;  // Track last receive time for desiredVehicleID
+
+// Graph freezing: freeze scrolling when no packets received for 20+ seconds
+bool graphsFrozen = false;
+unsigned long graphFrozenTime = 0;
 
 // Transition counter: Driving to Charging transitions
 char lastVehicleStatus[32] = "";
@@ -84,7 +88,7 @@ struct SharedData {
   char temperature[32];
   char s1_radius[32];
   char v5v[32];
-  int pid_output;
+  int steering_output;
   bool lapFlag;
 } sharedData;
 
@@ -106,10 +110,10 @@ void receiveCallback(const uint8_t *mac, const uint8_t *data, int len) {
         return;
     }
 
-    // Parse the space-separated values (new format: vehicleID, vehicleStatus, millis, vbatt, vcharge, icharge, charge_status, status_bits, charge_code, temperature, s1_radius, v5v, pid_output, lapFlag)
+    // Parse the space-separated values (new format: vehicleID, vehicleStatus, millis, vbatt, vcharge, icharge, charge_status, status_bits, charge_code, temperature, s1_radius, v5v, steering_output, lapFlag)
     uint8_t vehicleID;
     char vehicleStatus[32], vBatt[32], vCharge[32], iCharge[32], charge_status[32], status_bits[32];
-    char temperature[32], s1_radius[32], v5v[32], pid_output_str[32];
+    char temperature[32], s1_radius[32], v5v[32], steering_output_str[32];
     unsigned long vehicleMillis = 0;
     int charge_codeInt = 0;
     int lapFlagInt = 0;
@@ -117,9 +121,9 @@ void receiveCallback(const uint8_t *mac, const uint8_t *data, int len) {
     // Parse the new format with all 14 fields (including millis and lapFlag)
     int parsed = sscanf(buffer, "-%hhu %31s %lu %31s %31s %31s %31s %31s %d %31s %31s %31s %31s %d",
         &vehicleID, vehicleStatus, &vehicleMillis, vBatt, vCharge, iCharge, charge_status, status_bits, &charge_codeInt,
-        temperature, s1_radius, v5v, pid_output_str, &lapFlagInt);
+        temperature, s1_radius, v5v, steering_output_str, &lapFlagInt);
 
-    // Verify we got at least 13 values (vehicleID through pid_output). lapFlag is at position 14.
+    // Verify we got at least 13 values (vehicleID through steering_output). lapFlag is at position 14.
     if (parsed < 13) {
       return;
     }
@@ -161,7 +165,7 @@ void receiveCallback(const uint8_t *mac, const uint8_t *data, int len) {
       Serial.print(" | v5v: ");
       Serial.println(v5v);
       //Serial.print(" | PID: ");
-      //Serial.print(pid_output_str);
+      //Serial.print(steering_output_str);
       //Serial.print(" | lapFlag: ");
       //Serial.println(lapFlagInt);
       //*/
@@ -191,9 +195,11 @@ void receiveCallback(const uint8_t *mac, const uint8_t *data, int len) {
       sharedData.s1_radius[sizeof(sharedData.s1_radius) - 1] = '\0';
       strncpy(sharedData.v5v, v5v, sizeof(sharedData.v5v) - 1);
       sharedData.v5v[sizeof(sharedData.v5v) - 1] = '\0';
-      sharedData.pid_output = (int)atof(pid_output_str);
+      sharedData.steering_output = (int)atof(steering_output_str);
       sharedData.lapFlag = lapFlagInt ? true : false;
       newDataAvailable = true;
+      // Unfreeze graphs when new data arrives
+      graphsFrozen = false;
       interrupts();
     }
 }
@@ -214,7 +220,8 @@ void drawVBattGraph() {
 
   // X-axis window: 30 minutes
   unsigned long timeWindow = 30 * 60 * 1000UL;  // 30 minutes in milliseconds
-  unsigned long now = millis();
+  // Use frozen time if graphs are frozen, otherwise use current time
+  unsigned long now = graphsFrozen ? graphFrozenTime : millis();
 
   // Determine dynamic vMin/vMax from buffer
   float vMin = 10.0f;
@@ -374,7 +381,7 @@ void updateDisplayFromData() {
   char temperatureLoc[32];
   char s1_radiusLoc[32];
   char v5vLoc[32];
-  int pid_outputLoc;
+  int steering_outputLoc;
   uint8_t vehicleIDLoc = 0;
   bool lapFlagLoc = false;
 
@@ -399,7 +406,7 @@ void updateDisplayFromData() {
   s1_radiusLoc[sizeof(s1_radiusLoc) - 1] = '\0';
   strncpy(v5vLoc, sharedData.v5v, sizeof(v5vLoc) - 1);
   v5vLoc[sizeof(v5vLoc) - 1] = '\0';
-  pid_outputLoc = sharedData.pid_output;
+  steering_outputLoc = sharedData.steering_output;
   // mark consumed
   newDataAvailable = false;
   interrupts();
@@ -460,10 +467,10 @@ void updateDisplayFromData() {
   }
   lcd.print("C");
 
-  // Draw pid_output as a yellow 4x4 pixel square mapped across the full width
+  // Draw steering_output as a yellow 4x4 pixel square mapped across the full width
   // pid range: 800 (left) .. 2200 (right). Place directly below second text line.
   {
-    int pid = pid_outputLoc;
+    int pid = steering_outputLoc;
     // Clamp to new range
     if (pid < 800) pid = 800;
     if (pid > 2200) pid = 2200;
@@ -707,11 +714,16 @@ void loop() {
       drawVBattGraph();
     }
 
-    // Draw solid red border if elapsed_s > 20
+    // Draw solid red border if elapsed_s > 20 and freeze graphs
     unsigned long elapsed_ms = millis() - lastDesiredVehicleReceiveTime;
     unsigned long elapsed_s = elapsed_ms / 1000;
     int thickness = 3;
     if (elapsed_s > 20) {
+      // Freeze graphs at this time if not already frozen
+      if (!graphsFrozen) {
+        graphsFrozen = true;
+        graphFrozenTime = millis();
+      }
       // Top
       lcd.fillRect(0, 0, screenWidth, thickness, ST77XX_RED);
       // Bottom
